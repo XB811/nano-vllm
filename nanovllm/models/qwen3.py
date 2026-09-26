@@ -12,6 +12,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
+    """Qwen3 的 GQA self-attention，并把投影按 TP rank 切分。"""
 
     def __init__(
         self,
@@ -27,6 +28,7 @@ class Qwen3Attention(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
+        # total_* 是整模型配置；本 rank 只计算对应的 attention/KV heads。
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -66,6 +68,7 @@ class Qwen3Attention(nn.Module):
             self.num_kv_heads,
         )
         if not self.qkv_bias:
+            # 无 bias 的 Qwen3 配置在 RoPE 前额外对每个 head 做 RMSNorm。
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -74,6 +77,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 一次矩阵乘法同时得到 Q/K/V，再按本 rank 的 head 数拆分。
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -82,13 +86,16 @@ class Qwen3Attention(nn.Module):
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # RoPE 使用绝对 position，兼容 packed prefill 和单 token decode。
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
+        # attention 输出按 head 拼平后，row-parallel projection 会跨 rank 汇总。
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
+    """Qwen3 的 SwiGLU 前馈网络。"""
 
     def __init__(
         self,
@@ -111,6 +118,7 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # gate 和 up 合并成一次投影，SiluAndMul 后再做 down projection。
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
@@ -118,6 +126,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
+    """一个 pre-norm Transformer decoder block。"""
 
     def __init__(
         self,
@@ -149,17 +158,20 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 第一层建立 residual；后续层复用融合 add+rmsnorm，减少一次显存读写。
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
+        # attention 与 MLP 共用同一条 residual stream。
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 class Qwen3Model(nn.Module):
+    """Qwen3 主干：词嵌入、decoder layers 和最终 RMSNorm。"""
 
     def __init__(
         self,
@@ -175,15 +187,20 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # input_ids 在 prefill 是 packed prompt，在 decode 是每条序列的一个 token。
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        # 最后一层仍需把 residual 融合进 hidden_states 后归一化。
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
+    """Qwen3 backbone + 词表并行 LM head。"""
+
+    # safetensors 中的独立投影名称需要映射到模型里的 packed 参数切片。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -200,6 +217,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
+            # 权重绑定可避免重复存储 embedding 和输出头的词表参数。
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
@@ -207,10 +225,12 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # backbone 单独返回 hidden states，便于 CUDA Graph 捕获固定形状主干。
         return self.model(input_ids, positions)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # logits 在主进程上用于采样；TP 模式下 ParallelLMHead 会先 gather 词表维。
         return self.lm_head(hidden_states)

@@ -7,6 +7,7 @@ from nanovllm.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
+    """按词表维切分 embedding，并在 forward 后合并各 rank 的局部结果。"""
 
     def __init__(
         self,
@@ -33,16 +34,19 @@ class VocabParallelEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
+            # 不属于本 rank 词表分片的 token 映射为 0，之后用 mask 清零其 embedding。
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
+            # 每个 token 只有一个 rank 有效，all_reduce 后得到完整 embedding。
             dist.all_reduce(y)
         return y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """按词表维切分 LM head；rank 0 收集完整 logits 用于采样。"""
 
     def __init__(
         self,
@@ -56,10 +60,13 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
+            # packed prefill 会产生每个 prompt 的所有 hidden states，但只需每条
+            # prompt 最后一个位置的 logits 来采样第一个 completion token。
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
+            # logits 沿词表维拼接；非 0 rank 不需要保留完整 logits。
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None

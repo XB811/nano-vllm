@@ -5,11 +5,13 @@ import torch.distributed as dist
 
 
 def divide(numerator, denominator):
+    """TP 切分维度必须整除，避免不同 rank 形状不一致。"""
     assert numerator % denominator == 0
     return numerator // denominator
 
 
 class LinearBase(nn.Module):
+    """带有权重加载钩子的线性层基类。"""
 
     def __init__(
         self,
@@ -20,6 +22,7 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
+        # dist 进程组在 ModelRunner 初始化前已建立，因此这里可以直接取得 rank。
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -35,6 +38,7 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
+    """每个 rank 保存完整权重、独立计算输出的线性层。"""
 
     def __init__(
         self,
@@ -52,6 +56,7 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
+    """按输出维切分权重；输入在各 rank 上相同，输出只保留本地列。"""
 
     def __init__(
         self,
@@ -74,6 +79,11 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
+    """把多个逻辑投影拼成一个权重并沿输出维切分。
+
+    Qwen3 的 gate/up 投影共享一次矩阵乘法，减少 kernel launch；加载权重时
+    通过 shard id 写入对应的子区间。
+    """
 
     def __init__(
         self,
@@ -94,6 +104,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
+    """把 Q、K、V 拼接后按 head 切分，适配 GQA/MQA 的不同 KV head 数。"""
 
     def __init__(
         self,
@@ -129,6 +140,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
+    """按输入维切分权重，局部结果通过 all_reduce 合并。"""
 
     def __init__(
         self,
@@ -152,5 +164,6 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
+            # 每个 rank 只计算输入分片对应的部分和，需要求和得到完整输出。
             dist.all_reduce(y)
         return y

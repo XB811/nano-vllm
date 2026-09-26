@@ -8,6 +8,7 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
+    """对 head 的两半维度施加 RoPE 旋转，保留输入 dtype。"""
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
@@ -15,6 +16,7 @@ def apply_rotary_emb(
 
 
 class RotaryEmbedding(nn.Module):
+    """预计算位置相关的正余弦表，并应用到 Q/K。"""
 
     def __init__(
         self,
@@ -41,6 +43,7 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # positions 可以是 packed prefill 的非连续位置，也可以是 decode 的单步位置。
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         query = apply_rotary_emb(query, cos, sin)
@@ -55,5 +58,6 @@ def get_rope(
     max_position: int,
     base: float,
 ):
+    # 相同模型配置共享 RoPE 实例，避免重复创建位置编码表。
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

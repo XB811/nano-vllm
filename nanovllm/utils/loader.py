@@ -6,10 +6,16 @@ from safetensors import safe_open
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+    """默认的整块权重复制逻辑。"""
     param.data.copy_(loaded_weight)
 
 
 def load_model(model: nn.Module, path: str):
+    """逐个读取 safetensors，并按模型声明的映射加载 TP 权重分片。
+
+    ``packed_modules_mapping`` 把 Hugging Face 的 q/k/v、gate/up 参数名映射到
+    实际合并参数；对应参数的 ``weight_loader`` 负责选择当前 rank 的切片。
+    """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
