@@ -13,7 +13,9 @@ class Scheduler:
     """
 
     def __init__(self, config: Config):
+        # 单批次最多处理多少个请求
         self.max_num_seqs = config.max_num_seqs
+        # 轮调度中，最多允许处理多少个 token
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
@@ -30,31 +32,39 @@ class Scheduler:
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
+        # 本轮调度中，已经处理的token数量
         num_batched_tokens = 0
 
         # prefill：优先消化等待队列。一个请求可能因 token 上限被切成多个
-        # chunk，只有第一个请求允许这样做，避免队头大请求阻塞整个批次。
+        # 只允许本轮第一个请求被拆分；后续请求必须完整放入剩余 token 预算，
+        # 避免同一批次产生多个未完成的 prefill chunk。
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+            # 取队列的队头请求
             seq = self.waiting[0]
+            # 本batch中，剩余的prefill token额度
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
+            # 计算num_tokens：seq需要prefill的token数量
             if not seq.block_table:
-                # 首次调度时尝试复用完整的、已哈希的前缀 block；返回 -1
-                # 表示物理 KV cache 不足，当前请求和后续请求都暂不调度。
+                # 首次调度时尝试复用完整的、已哈希的前缀 block；
+                # 返回 -1：表示物理 KV cache 不足，当前请求和后续请求都暂不调度。
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
+                # 如果block_table 存在，说明该请求被chunked prefill, seq.num_cached_tokens = 已经prefill的token数量
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+            # 每批次只允许第一个请求能够chunked prefill
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            # 本轮实际处理的 token 数，下一轮会从 num_cached_tokens 继续。
+            # 本轮实际处理的 token 数。如果该请求没有prefill完成（即chunk prefill），则下一轮会从 seq.num_cached_tokens 继续。
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            # 如果请求的缓存token数 + 本地prefix的token数量 = 请求的总token数量，说明该请求已经全部prefill，需要更新seq.status
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()

@@ -63,8 +63,10 @@ class LLMEngine:
     def step(self):
         """执行一轮调度、模型前向、采样和请求状态更新。"""
         seqs, is_prefill = self.scheduler.schedule()
-        # prefill 的工作量按处理 token 计；decode 每个序列恰好生成一个 token。
+        # prefill 的工作量按处理 token 计，用正数表示；decode 每个序列恰好生成一个 token，用负数表示。
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # 对于所有的seq，得到一个采样结果（即预测得到的下一个词）；
+        # 如果是尚未完成的 chunked prefill，这个采样结果会在后面被忽略。
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
