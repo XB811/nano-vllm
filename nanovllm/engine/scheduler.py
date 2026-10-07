@@ -94,6 +94,7 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
+        # 重新按照原来的顺序，把seq插入到running队列的左侧
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -113,6 +114,7 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 # chunked prefill 尚未覆盖完整 prompt，此轮没有可采样的输出。
+                # 当prefill刚好到最后一个chunk时， seq.num_cached_tokens == seq.num_tokens，所以会继续采样输出
                 continue
             seq.append_token(token_id)
             # EOS 或达到用户限制时释放整个请求的 KV cache。

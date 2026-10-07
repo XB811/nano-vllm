@@ -118,7 +118,12 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        """判断追加下一个 token 是否可能需要新页。"""
+        """
+        判断追加下一个 token 目前空闲的block数量是否能满足需求
+        如果不需要新的block，返回true
+        如果需要新的block，且block_manager有空闲的block，则返回true
+        如个需要新的block，但是block_manager没有可分配的block了，则返回false
+        """
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
