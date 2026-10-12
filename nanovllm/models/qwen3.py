@@ -109,6 +109,14 @@ class Qwen3MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
         )
+        """    
+        down_proj.wight 形状是  hidden_size * intermediate_size 
+        因为F.linear（y = x @ weight.T + bias） 实际在计算时wight的形状是 intermediate_size * hidden_size，
+    
+        由于forward的入参x 在升维计算时按照列 intermediate_size 进行了切分，所以down_proj只能按照行维度 intermediate_size 拆分
+        然后与x计算后，逐元素相加，得到最终结果
+        TP并向时行列切分的计算逻辑参考https://zhuanlan.zhihu.com/p/1930568107824504899
+        """
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -158,14 +166,17 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 第一层建立 residual；后续层复用融合 add+rmsnorm，减少一次显存读写。
+        # 1、 归一化
         if residual is None:
+            # 残差为空，即第一层，则直接使用hidden_states(即embedding 得到的输入数据) 作为下一层残差
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # 2、 attention层
         hidden_states = self.self_attn(positions, hidden_states)
-        # attention 与 MLP 共用同一条 residual stream。
+        # 3、 再次归一化
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # 4、 FFN
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -178,6 +189,7 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        # embedding层，将token转化为张量
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

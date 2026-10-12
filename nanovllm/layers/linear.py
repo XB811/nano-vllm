@@ -25,6 +25,7 @@ class LinearBase(nn.Module):
         # dist 进程组在 ModelRunner 初始化前已建立，因此这里可以直接取得 rank。
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
+        # 因为  F.linear 计算公式是y = x @ weight.T + bias， 通过初始化将weight反转，实现模型要求的计算公式
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -71,6 +72,7 @@ class ColumnParallelLinear(LinearBase):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
+        # tp_dim 切分维度；start_idx 起始下标； shard_size 分片长度
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
@@ -83,6 +85,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
     Qwen3 的 gate/up 投影共享一次矩阵乘法，减少 kernel launch；加载权重时
     通过 shard id 写入对应的子区间。
+
+    self.wight 的形状是sum(output_sizes) * input_size
+    通过F.linear（y = x @ weight.T + bias），self.wight 会被转置并计算
+    最终x.shape 由 N * input_size 转化为 N*sum(output_sizes)
+
+    TP时，由于父类的转置等操作，实际上wight是按照output_sizes维度切分的
     """
 
     def __init__(
@@ -95,10 +103,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        # 将各个逻辑投影按照tp_size 拆分，然后放到各个rank中
+        # 例： 逻辑投影有3块，在self.tp_dim的宽度分别为 [1024,2048,1096] tp_size =4
+        # 则 rank0 分配到各逻辑投影的 [0~255、0~511、0～1023]
+        # rank1 [256~511、512～1023、1024～2047]
+        # rank2 [512～767、1024～1535、2048～3071]
+        # rank3 【768～1023、1536～2047、3072～4095]
         param_data = param.data
+        # 第loaded_shard_id逻辑投影，在本rank上的起始位置
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+        # 第loaded_shard_id逻辑投影 分在一个rank上的块大小
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+        # 切出当前逻辑投影在本rank上存储wight的具体位置
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        # 使用tp_rank，从具体的模型权重中，切出应该放到本rank的数据
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
@@ -162,6 +180,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # TP行维度切分， 仅允许rank0添加偏置，避免重复多次计算偏置
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             # 每个 rank 只计算输入分片对应的部分和，需要求和得到完整输出。

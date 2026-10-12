@@ -147,7 +147,33 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        """把变长 Python 页表 padding 成 flash-attn 可批处理的二维 tensor。"""
+        """
+        将 batch 中每条序列长度不一致的 block_table，
+        padding 成统一形状的二维 CUDA Tensor。
+
+        返回：
+            block_tables:
+                shape = [batch_size, max_num_blocks]
+                dtype = torch.int32
+                device = CUDA
+
+            其中：
+                - 正数表示物理 KV-cache block ID
+                - -1 表示 padding，不是有效的 block ID
+        示例：
+            输入：
+                seqs = [
+                    Sequence(block_table=[3, 7]),
+                    Sequence(block_table=[4]),
+                    Sequence(block_table=[8, 2, 9]),
+                ]
+            输出：
+                [
+                    [3, 7, -1],
+                    [4, -1, -1],
+                    [8, 2, 9],
+                ]
+        """
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -159,6 +185,11 @@ class ModelRunner:
         query 只包含本轮尚未计算的 token；如果命中了前缀缓存，key/value
         还需要访问已缓存的 prefix，因此 ``cu_seqlens_k`` 会大于 ``q``。
         """
+        # # 将多个seq本次要prefill的token序列，拼接成一个数组
+        # 比如seqs= [seq1,seq2],有两个句子
+        # seq1本次处理的tokens为 [101,234,104] 绝对位置在seq1的 [4,5,6]
+        # seq2本次处理的tokens为 [10,20,30,40] 绝对位置在seq2的 [9,10,11,12]
+        # 最终结果input_ids=[101,234,104,10,20,30,40] positions=[4,5,6,9,10,11,12]
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -169,8 +200,10 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             start = seq.num_cached_tokens
+            # 本次需要处理的chunk prefill（即num_scheduled_tokens），计算q
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
+            # num_cache_tokens + num_scheduled_tokens，计算k
             seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
@@ -181,6 +214,9 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             # slot_mapping 描述本轮新 K/V 应写入物理 cache 的连续槽位。
+            # 示例：
+            # 如果seqs中存在两个seq，分别长度为11、17，block_size=256，则计算完成后，slot_mapping值为：
+            # [0、1、2、......9、10、256、257、......271、272]
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
@@ -193,8 +229,13 @@ class ModelRunner:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            # 只有存在已缓存 prefix 时才需要 block table；没有 prefix 时 flash-attn
-            # 直接使用当前 batch 的 packed K/V。
+            # 如果本轮 K 包含已经写入 KV cache 的历史 token，
+            # 则需要通过 block_tables 定位这些历史 block。
+            #
+            # 这种情况包括：
+            # 1. 命中 prefix cache；
+            # 2. chunked prefill 的后续 chunk。
+            # 同时，对于批处理下的seqs，需要用-1将block_table 填充到相同的长度
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -206,10 +247,11 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         """准备 decode 阶段每个请求的一个 token 和分页 KV cache 元数据。"""
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+        input_ids = [] # 每个seq的最后一个token，最后拼成一个数组
+        positions = [] # 每个seq的最后一个token的绝对位置编码
+        slot_mapping = [] # 每个seq的最后一个token，在物理block中的位置。
+                          # 例子：某seq占用第1个物理block块（编号从0开始、block_size = 256），seq长度为17, 则last_token的slot为 1*256 + (last_token 在last_block中的位置<编号从1开始>)-1
+        context_lens = [] # 每个seq的长度
         for seq in seqs:
             # 当前前向的输入是已生成的最后一个 token，模型会把对应 K/V 写入
             # 它所在的 cache slot，并用完整历史做 attention。
@@ -226,7 +268,11 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        """把每个请求独立的 temperature 搬到 GPU。"""
+        """
+        将每个seq的采样温度转为张量，并迁移到GPU上
+        :param seqs:
+        :return:
+        """
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
