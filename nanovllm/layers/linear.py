@@ -143,6 +143,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
+        # 计算数据应该保存在本rank的self.wight的 起始位置和偏移量
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0

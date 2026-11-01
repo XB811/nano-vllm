@@ -109,6 +109,8 @@ class BlockManager:
 
     def deallocate(self, seq: Sequence):
         """释放请求的所有页表引用，必要时将物理页归还空闲队列。"""
+        # 逆序释放 block 引用（逆序把block放入free_block_ids），让前边的block尽可能晚被回收
+        # 好处是在 尽可能保留一个文本的前缀，以此让后来的请求有更大的概率命中prefix caching。
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1

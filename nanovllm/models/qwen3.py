@@ -59,7 +59,7 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
-            base=rope_theta,
+            base=rope_theta, # RoPE 的频率基数
         )
         self.attn = Attention(
             self.num_heads,
@@ -80,6 +80,11 @@ class Qwen3Attention(nn.Module):
         # 一次矩阵乘法同时得到 Q/K/V，再按本 rank 的 head 数拆分。
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # 变换前
+        # q.shape = [N, num_heads * head_dim]
+        # 变换后
+        # q.shape = [N, num_heads, head_dim]
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
